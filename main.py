@@ -26,6 +26,7 @@ _IP_LOCATION_CACHE_MAX = 50_000
 _MAX_IPS_PER_DOMAIN = 6
 _MAX_GEO_IPS_PER_REQUEST = 300
 _MAX_GEO_CONCURRENCY = 3
+_UNKNOWN_RETRY_DELAY_SECONDS = 0.4
 
 
 class BatchRequest(BaseModel):
@@ -173,11 +174,35 @@ def get_ip_location(ip: str) -> dict:
         for c in candidates
         if c.get("country") and c.get("country") != "Unknown"
     }
+    retried = False
+    if not distinct_countries:
+        time.sleep(_UNKNOWN_RETRY_DELAY_SECONDS)
+        retried = True
+        retry_candidates: list[dict] = []
+        retry_primary = lookup_ip_api(ip)
+        if retry_primary:
+            retry_candidates.append(retry_primary)
+        retry_secondary = lookup_ipwhois(ip)
+        if retry_secondary:
+            retry_candidates.append(retry_secondary)
+        if retry_candidates:
+            candidates = retry_candidates
+            best = next(
+                (item for item in candidates if item.get("country") and item.get("country") != "Unknown"),
+                candidates[0],
+            )
+            distinct_countries = {
+                c.get("country")
+                for c in candidates
+                if c.get("country") and c.get("country") != "Unknown"
+            }
     discrepancy = len(distinct_countries) > 1
 
     result = dict(best)
     result["discrepancy"] = discrepancy
     result["sources"] = candidates
+    if retried:
+        result["retried"] = True
     if discrepancy:
         result["country_candidates"] = sorted(distinct_countries)
 

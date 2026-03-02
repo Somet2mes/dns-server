@@ -151,7 +151,10 @@ def get_ip_location(ip: str) -> dict:
     if not candidates:
         return remember({"country": "Unknown", "source": "unknown"}, _IP_LOCATION_FAIL_TTL_SECONDS)
 
-    best = primary or secondary or third
+    best = next(
+        (item for item in candidates if item.get("country") and item.get("country") != "Unknown"),
+        candidates[0],
+    )
     distinct_countries = {
         c.get("country")
         for c in candidates

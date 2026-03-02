@@ -23,6 +23,9 @@ _ip_location_cache_lock = Lock()
 _IP_LOCATION_OK_TTL_SECONDS = 24 * 60 * 60
 _IP_LOCATION_FAIL_TTL_SECONDS = 5 * 60
 _IP_LOCATION_CACHE_MAX = 50_000
+_MAX_IPS_PER_DOMAIN = 6
+_MAX_GEO_IPS_PER_REQUEST = 300
+_MAX_GEO_CONCURRENCY = 3
 
 
 class BatchRequest(BaseModel):
@@ -39,7 +42,17 @@ def resolve_domain(domain: str, dns_server: str) -> list[str]:
     r.lifetime = 5
     try:
         answers = r.resolve(domain, 'A')
-        return [a.to_text() for a in answers]
+        seen: set[str] = set()
+        ips: list[str] = []
+        for answer in answers:
+            ip = answer.to_text()
+            if ip in seen:
+                continue
+            seen.add(ip)
+            ips.append(ip)
+            if len(ips) >= _MAX_IPS_PER_DOMAIN:
+                break
+        return ips
     except Exception as e:
         logging.warning(f"解析 {domain} 失败 (DNS: {dns_server}): {e}")
         return []
@@ -191,19 +204,36 @@ async def batch_resolve(req: BatchRequest):
             return
 
         entry = {"success": True, "ips": ips}
-        if req.include_location:
-            ip_locations = {}
-            locs = await asyncio.gather(
-                *[loop.run_in_executor(executor, get_ip_location, ip) for ip in ips]
-            )
-            for ip, loc in zip(ips, locs):
-                ip_locations[ip] = loc
-            entry["ip_locations"] = ip_locations
-
         results[domain] = entry
         success_count += 1
 
     await asyncio.gather(*[process_domain(d) for d in req.domains])
+
+    if req.include_location:
+        unique_ips: list[str] = []
+        seen_ips: set[str] = set()
+        for entry in results.values():
+            for ip in entry.get("ips", []):
+                if ip in seen_ips:
+                    continue
+                seen_ips.add(ip)
+                unique_ips.append(ip)
+        capped_ips = unique_ips[:_MAX_GEO_IPS_PER_REQUEST]
+        semaphore = asyncio.Semaphore(_MAX_GEO_CONCURRENCY)
+
+        async def limited_lookup(target_ip: str):
+            async with semaphore:
+                return await loop.run_in_executor(executor, get_ip_location, target_ip)
+
+        locs = await asyncio.gather(*[limited_lookup(ip) for ip in capped_ips])
+        loc_map = {ip: loc for ip, loc in zip(capped_ips, locs)}
+        for entry in results.values():
+            if not entry.get("success"):
+                continue
+            ip_locations = {}
+            for ip in entry.get("ips", []):
+                ip_locations[ip] = loc_map.get(ip) or {"country": "Unknown", "source": "skipped"}
+            entry["ip_locations"] = ip_locations
 
     return {
         "total_domains": len(req.domains),
